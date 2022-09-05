@@ -118,6 +118,9 @@ struct usiw_wc {
 	enum ibv_wc_opcode opcode;
 	uint32_t byte_len;
 	uint32_t qp_num;
+
+	uint32_t wc_flags; // it can be 0 or IBV_WC_WITH_IMM
+	uint32_t imm_data; // valid when IBV_WC_WITH_IMM is set.
 };
 
 struct usiw_recv_wqe {
@@ -129,6 +132,8 @@ struct usiw_recv_wqe {
 	size_t total_request_size;
 	size_t recv_size;
 	size_t input_size;
+
+	uint32_t imm_data; // the immeidate data
 
 	size_t iov_count;
 	struct iovec iov[];
@@ -156,6 +161,9 @@ enum usiw_send_opcode {
 	usiw_wr_write = 1,
 	usiw_wr_read = 2,
 	usiw_wr_atomic = 3,
+
+	usiw_wr_send_with_imm = 4,
+	usiw_wr_write_with_imm = 5,
 };
 
 enum {
@@ -181,6 +189,8 @@ struct usiw_send_wqe {
 	size_t total_length;
 	size_t bytes_sent;
 	size_t bytes_acked;
+
+	uint32_t imm_data;
 
 	size_t iov_count;
 	struct iovec iov[];

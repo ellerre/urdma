@@ -751,6 +751,8 @@ post_recv_cqe(struct usiw_qp *qp, struct usiw_recv_wqe *wqe,
 	cqe->opcode = IBV_WC_RECV;
 	cqe->byte_len = wqe->input_size;
 	cqe->qp_num = qp->ib_qp.qp_num;
+	cqe->imm_data = wqe->imm_data;
+	cqe->wc_flags = IBV_WC_WITH_IMM;
 
 	qp_free_recv_wqe(qp, wqe);
 	finish_post_cqe(cq, cqe);
@@ -763,8 +765,10 @@ get_ibv_send_wc_opcode(struct usiw_send_wqe *wqe)
 {
 	switch (wqe->opcode) {
 	case usiw_wr_send:
+	case usiw_wr_send_with_imm:
 		return IBV_WC_SEND;
 	case usiw_wr_write:
+	case usiw_wr_write_with_imm:
 		return IBV_WC_RDMA_WRITE;
 	case usiw_wr_read:
 		return IBV_WC_RDMA_READ;
@@ -882,7 +886,12 @@ do_rdmap_send(struct usiw_qp *qp, struct usiw_send_wqe *wqe)
 	size_t payload_length;
 	uint16_t mtu = qp->shm_qp->mtu;
 
-	while (wqe->bytes_sent < wqe->total_length
+	if (wqe->state != SEND_WQE_TRANSFER) {
+		return;
+	}
+
+	while ((wqe->bytes_sent < wqe->total_length || 
+		(wqe->bytes_sent == 0 && wqe->total_length == 0))
 			&& serial_less_32(wqe->remote_ep->send_next_psn,
 					wqe->remote_ep->send_max_psn)) {
 		sendmsg = rte_pktmbuf_alloc(qp->dev->tx_ddp_mempool);
@@ -896,19 +905,27 @@ do_rdmap_send(struct usiw_qp *qp, struct usiw_send_wqe *wqe)
 				- wqe->bytes_sent <= mtu)
 			? DDP_V1_UNTAGGED_LAST_DF
 			: DDP_V1_UNTAGGED_DF;
-		new_rdmap->head.rdmap_info = rdmap_opcode_send | RDMAP_V1;
+		if (wqe->opcode == usiw_wr_send_with_imm) {
+			new_rdmap->head.rdmap_info = rdmap_opcode_send_with_imm | RDMAP_V1;
+			new_rdmap->head.immediate = wqe->imm_data;
+		} else {
+			new_rdmap->head.rdmap_info = rdmap_opcode_send | RDMAP_V1;
+			new_rdmap->head.immediate = 0;
+		}
 		new_rdmap->head.sink_stag = rte_cpu_to_be_32(0);
 		new_rdmap->qn = rte_cpu_to_be_32(0);
 		new_rdmap->msn = rte_cpu_to_be_32(wqe->msn);
 		new_rdmap->mo = rte_cpu_to_be_32(wqe->bytes_sent);
-		if (wqe->flags & usiw_send_inline) {
-			memcpy(PAYLOAD_OF(new_rdmap),
-					(char *)wqe->iov + wqe->bytes_sent,
-					payload_length);
-		} else {
-			memcpy_from_iov(PAYLOAD_OF(new_rdmap), payload_length,
-					wqe->iov, wqe->iov_count,
-					wqe->bytes_sent);
+		if (payload_length > 0) {
+        		if (wqe->flags & usiw_send_inline) {
+        			memcpy(PAYLOAD_OF(new_rdmap),
+        					(char *)wqe->iov + wqe->bytes_sent,
+        					payload_length);
+        		} else {
+        			memcpy_from_iov(PAYLOAD_OF(new_rdmap), payload_length,
+        					wqe->iov, wqe->iov_count,
+        					wqe->bytes_sent);
+        		}
 		}
 
 		send_ddp_segment(qp, sendmsg, NULL, wqe, payload_length);
@@ -919,6 +936,10 @@ do_rdmap_send(struct usiw_qp *qp, struct usiw_send_wqe *wqe)
 				wqe->bytes_sent + payload_length);
 
 		wqe->bytes_sent += payload_length;
+
+		if(wqe->total_length == 0) {
+			break;
+		}
 	}
 
 	if (wqe->bytes_sent == wqe->total_length) {
@@ -949,7 +970,13 @@ do_rdmap_write(struct usiw_qp *qp, struct usiw_send_wqe *wqe)
 				- wqe->bytes_sent <= mtu)
 			? DDP_V1_TAGGED_LAST_DF
 			: DDP_V1_TAGGED_DF;
-		new_rdmap->head.rdmap_info = RDMAP_V1 | rdmap_opcode_rdma_write;
+		if (wqe->opcode == usiw_wr_write_with_imm) {
+			new_rdmap->head.rdmap_info = rdmap_opcode_rdma_write_with_imm | RDMAP_V1;
+			new_rdmap->head.immediate = wqe->imm_data;
+		} else {
+			new_rdmap->head.rdmap_info = rdmap_opcode_rdma_write | RDMAP_V1;
+			new_rdmap->head.immediate = 0;
+		}
 		new_rdmap->head.sink_stag = rte_cpu_to_be_32(wqe->rkey);
 		new_rdmap->offset = rte_cpu_to_be_64(wqe->remote_addr
 				 + wqe->bytes_sent);
@@ -1241,6 +1268,7 @@ process_send(struct usiw_qp *qp, struct packet_context *orig)
 					ddp_error_untagged_no_buffer);
 		}
 		return;
+	} else {
 	}
 
 	offset = rte_be_to_cpu_32(rdmap->mo);
@@ -1270,6 +1298,8 @@ process_send(struct usiw_qp *qp, struct packet_context *orig)
 	if (wqe->recv_size == wqe->input_size) {
 		wqe->complete = true;
 	}
+
+	wqe->imm_data = rdmap->head.immediate;
 
 	/* Post completion, but only if there are no holes in the LLP packet
 	 * sequence. This ensures that even in the case of missing packets,
@@ -1860,7 +1890,7 @@ do_process_ack(struct usiw_qp *qp, struct usiw_send_wqe *wqe,
 	wqe->bytes_acked += pending->ddp_length;
 	assert(wqe->bytes_sent >= wqe->bytes_acked);
 
-	if ((wqe->opcode == usiw_wr_send || wqe->opcode == usiw_wr_write)
+	if ((wqe->opcode == usiw_wr_send || wqe->opcode == usiw_wr_write || wqe->opcode == usiw_wr_send_with_imm)
 			&& wqe->bytes_acked == wqe->total_length) {
 		assert(wqe->state == SEND_WQE_WAIT);
 		wqe->state = SEND_WQE_COMPLETE;
@@ -1919,6 +1949,7 @@ sweep_unacked_packets(struct usiw_qp *qp, uint64_t now)
 	for (count = 0; count < ep->tx_pending_size
 			&& (sendmsg = *ep->tx_head) != NULL; count++) {
 		pending = (struct pending_datagram_info *)(sendmsg + 1);
+
 		if (serial_less_32(pending->psn, ep->send_last_acked_psn)) {
 			/* Packet was acked */
 			if (pending->wqe) {
@@ -2040,6 +2071,7 @@ ddp_place_tagged_data(struct usiw_qp *qp, struct packet_context *orig)
 	case rdmap_opcode_rdma_read_response:
 		process_rdma_read_response(qp, orig);
 		break;
+	case rdmap_opcode_rdma_write_with_imm:
 	default:
 		RTE_LOG(DEBUG, USER1, "<dev=%" PRIx16 " qp=%" PRIx16 "> received DDP tagged message with invalid opcode %" PRIx8 "\n",
 				qp->shm_qp->dev_id, qp->shm_qp->qp_id,
@@ -2250,9 +2282,10 @@ process_data_packet(struct usiw_qp *qp, struct rte_mbuf *mbuf)
 	}
 
 	if (DDP_GET_T(ctx.rdmap->ddp_flags)) {
-		return ddp_place_tagged_data(qp, &ctx);
+		return ddp_place_tagged_data(qp, &ctx); //TODO
 	} else {
 		switch (RDMAP_GET_OPCODE(ctx.rdmap->rdmap_info)) {
+			case rdmap_opcode_send_with_imm:
 			case rdmap_opcode_send:
 			case rdmap_opcode_send_inv:
 			case rdmap_opcode_send_se:
@@ -2290,9 +2323,11 @@ progress_send_wqe(struct usiw_qp *qp, struct usiw_send_wqe *wqe)
 
 	switch (wqe->opcode) {
 	case usiw_wr_send:
+	case usiw_wr_send_with_imm:
 		do_rdmap_send((struct usiw_qp *)qp, wqe);
 		break;
 	case usiw_wr_write:
+	case usiw_wr_write_with_imm:
 		do_rdmap_write((struct usiw_qp *)qp, wqe);
 		break;
 	case usiw_wr_read:
@@ -2389,6 +2424,7 @@ progress_qp(struct usiw_qp *qp)
 	}
 
 	scount = 0;
+
 	list_for_each_safe(&qp->sq.active_head, send_wqe, next, active) {
 		if (list_next(&qp->sq.active_head, send_wqe, active)) {
 			rte_prefetch0(list_next(&qp->sq.active_head, send_wqe, active));
@@ -2405,6 +2441,7 @@ progress_qp(struct usiw_qp *qp)
 			assert(send_wqe->state == SEND_WQE_INIT);
 			send_wqe->state = SEND_WQE_TRANSFER;
 			switch (send_wqe->opcode) {
+				case usiw_wr_send_with_imm:
 				case usiw_wr_send:
 					send_wqe->msn = send_wqe->remote_ep
 							->next_send_msn++;
