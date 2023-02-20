@@ -93,17 +93,25 @@ usiw_hash_mr(uintptr_t addr, size_t len)
 } /* usiw_hash_mr */
 
 
-__attribute__((__visibility__("default")))
+__attribute__((__visibility__("default"))) 
 struct ibv_mr *
 urdma_reg_mr_with_rkey(struct ibv_pd *pd, void *addr, size_t len, int access,
-		uint32_t rkey)
+					   uint32_t rkey)
 {
 	struct usiw_mr_table *tbl = container_of(pd, struct usiw_mr_table, pd);
 	uint32_t hash = rkey % tbl->capacity;
 	struct usiw_mr *mr;
 
-	mr = malloc(sizeof(*mr));
-	if (!mr) {
+	// Prepare the name for the MR
+	char buf[13];
+	bzero(&buf, 13);
+	sprintf(&buf, "mr_%d", hash);
+
+	// Allocate with DPDK
+	mr = rte_malloc(&buf, sizeof(*mr), RTE_CACHE_LINE_SIZE);
+	if (!mr)
+	{
+		printf("%s():%i: Failed to allocate MR: %s\n", buf, __func__, __LINE__);
 		return NULL;
 	}
 

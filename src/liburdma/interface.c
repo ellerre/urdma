@@ -65,6 +65,9 @@
 #include <rte_malloc.h>
 #include <rte_mbuf.h>
 #include <rte_udp.h>
+#include <rte_common.h>
+#include <rte_interrupts.h>
+#include <rte_io.h>
 
 #include "interface.h"
 #include "proto.h"
@@ -135,7 +138,7 @@ usiw_dereg_mr_real(__attribute__((unused)) struct usiw_mr_table *tbl,
 {
 	struct usiw_mr *free_mr = *mr;
 	*mr = (*mr)->next;
-	free(free_mr);
+	rte_free(free_mr);
 } /* usiw_dereg_mr_real */
 
 int
@@ -344,14 +347,13 @@ flush_tx_queue(struct usiw_qp *qp)
 
 	begin = qp->txq;
 	do {
-		// if(qp->txq_end == begin) {
-		// 	return;
-		// }
 		ret = rte_eth_tx_burst(qp->dev->portid, qp->shm_qp->tx_queue,
 			begin, qp->txq_end - begin);
+
 		if (ret > 0) {
 			RTE_LOG(DEBUG, USER1, "Transmitted %d packets\n", ret);
 		}
+
 		begin += ret;
 	} while (begin != qp->txq_end);
 	qp->txq_end = qp->txq;
@@ -851,7 +853,7 @@ sq_flush(struct usiw_qp *qp)
 	rte_spinlock_unlock(&qp->sq.lock);
 } /* sq_flush */
 
-
+/// This was the function used before
 static void
 memcpy_from_iov(char * restrict dest, size_t dest_size,
 		const struct iovec * restrict src, size_t iov_count,
@@ -876,6 +878,83 @@ memcpy_from_iov(char * restrict dest, size_t dest_size,
 	}
 } /* memcpy_from_iov */
 
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+// Modified from DPDK fragmentation library
+typedef void (*rte_mbuf_extbuf_free_callback_t)(void *addr, void *opaque);
+
+#define RTE_MBUF_F_EXTERNAL    (1ULL << 61)
+
+/**
+ * Shared data at the end of an external buffer.
+ */
+struct rte_mbuf_ext_shared_info {
+	rte_mbuf_extbuf_free_callback_t free_cb; /**< Free callback function */
+	void *fcb_opaque;                        /**< Free callback argument */
+	uint16_t refcnt;
+};
+
+static inline void
+rte_mbuf_ext_refcnt_set(struct rte_mbuf_ext_shared_info *shinfo,
+	uint16_t new_value)
+{
+	__atomic_store_n(&shinfo->refcnt, new_value, __ATOMIC_RELAXED);
+}
+
+static inline void
+rte_pktmbuf_attach_extbuf(struct rte_mbuf *m, void *buf_addr,
+	rte_iova_t buf_iova, uint16_t buf_len)
+{
+	/* mbuf should not be read-only */
+	RTE_ASSERT(RTE_MBUF_DIRECT(m) && rte_mbuf_refcnt_read(m) == 1);
+	RTE_ASSERT(shinfo->free_cb != NULL);
+
+	m->buf_addr = buf_addr;
+	m->buf_iova = buf_iova;
+	m->buf_len = buf_len;
+
+	m->data_len = 0;
+	m->data_off = 0;
+
+	m->ol_flags |= RTE_MBUF_F_EXTERNAL;
+}
+
+static void
+put_iov_in_chain(struct rte_mempool * pool, struct rte_mbuf * head_pkt, size_t dest_size,
+		const struct iovec * restrict src, size_t iov_count,
+		size_t offset)
+{
+	unsigned y;
+	size_t prev, pos, cur;
+	char *src_iov_base;
+	struct rte_mbuf * prev_pkt = head_pkt;
+
+	pos = 0;
+	for (y = 0, prev = 0; pos < dest_size && y < iov_count; ++y) {
+		if (prev <= offset && offset < prev + src[y].iov_len) {
+			cur = RTE_MIN(prev + src[y].iov_len - offset,
+					dest_size - pos);
+			src_iov_base = src[y].iov_base;
+
+            // Prepare an mbuf to point at the relevant payload
+			struct rte_mbuf * payload_mbuf = rte_pktmbuf_alloc(pool);
+			char *data = src_iov_base + offset - prev;
+			rte_iova_t iova = rte_mem_virt2iova(data);
+            // Attach the memory buffer to the mbuf
+            rte_pktmbuf_attach_extbuf(payload_mbuf, data, iova, cur);
+            payload_mbuf->data_len = cur;
+			// Put packets in chain
+			head_pkt->pkt_len = head_pkt->pkt_len + payload_mbuf->data_len;
+			head_pkt->nb_segs += 1;
+			prev_pkt->next = payload_mbuf;
+			prev_pkt = payload_mbuf;
+
+			pos += cur;
+			offset += cur;
+		}
+		prev += src[y].iov_len;
+	}
+} /* put_iov_in_chain */
 
 static void
 do_rdmap_send(struct usiw_qp *qp, struct usiw_send_wqe *wqe)
@@ -957,6 +1036,9 @@ do_rdmap_write(struct usiw_qp *qp, struct usiw_send_wqe *wqe)
 	uint16_t mtu = qp->shm_qp->mtu;
 	void *payload;
 
+	// THIS IS A FORM OF APP-LEVEL FRAGMENTATION
+	// They do this here for their stack, it is ok,
+	// for the moment we just need to make it zero-copy
 	while (wqe->bytes_sent < wqe->total_length
 			&& serial_less_32(wqe->remote_ep->send_next_psn,
 					wqe->remote_ep->send_max_psn)) {
@@ -980,15 +1062,24 @@ do_rdmap_write(struct usiw_qp *qp, struct usiw_send_wqe *wqe)
 		new_rdmap->head.sink_stag = rte_cpu_to_be_32(wqe->rkey);
 		new_rdmap->offset = rte_cpu_to_be_64(wqe->remote_addr
 				 + wqe->bytes_sent);
-		payload = rte_pktmbuf_append(sendmsg, payload_length);
+	
+		// Copy inline data, which are small
 		if (wqe->flags & usiw_send_inline) {
+			payload = rte_pktmbuf_append(sendmsg, payload_length);
 			memcpy(payload, (char *)wqe->iov + wqe->bytes_sent,
 					payload_length);
 		} else {
-			memcpy_from_iov(payload, payload_length,
+			// Do not copy
+			put_iov_in_chain(qp->dev->tx_ddp_mempool, sendmsg, payload_length,
 					wqe->iov, wqe->iov_count,
 					wqe->bytes_sent);
+			// memcpy_from_iov(payload, payload_length,
+			// 		wqe->iov, wqe->iov_count,
+			// 		wqe->bytes_sent);
 		}
+
+		// RTE_LOG(INFO, USER1, "Total size is %d and payload_len is %d\n", sendmsg->pkt_len, payload_length);
+
 
 		send_ddp_segment(qp, sendmsg, NULL, wqe, payload_length);
 		RTE_LOG(DEBUG, USER1, "<dev=%" PRIx16 " qp=%" PRIx16 "> RDMA WRITE transmit bytes %zu through %zu\n",
